@@ -1,63 +1,58 @@
+const Razorpay = require('razorpay');
+const crypto = require('crypto');
 const pool = require('../config/db');
 
-let razorpay = null;
-try {
-  if (process.env.RAZORPAY_KEY_ID && process.env.RAZORPAY_KEY_ID !== 'placeholder') {
-    const Razorpay = require('razorpay');
-    razorpay = new Razorpay({
-      key_id: process.env.RAZORPAY_KEY_ID,
-      key_secret: process.env.RAZORPAY_KEY_SECRET,
-    });
+const getRazorpay = () => {
+  if (!process.env.RAZORPAY_KEY_ID || process.env.RAZORPAY_KEY_ID === 'placeholder') {
+    throw new Error('Razorpay not configured');
   }
-} catch (e) {
-  console.log('Razorpay not configured');
-}
+  return new Razorpay({
+    key_id: process.env.RAZORPAY_KEY_ID,
+    key_secret: process.env.RAZORPAY_KEY_SECRET,
+  });
+};
 
 const createPaymentOrder = async (req, res) => {
   try {
-    const { amount, currency = 'INR' } = req.body;
-
-    if (!razorpay) {
-      return res.json({
-        success: true,
-        mock: true,
-        order: {
-          id: 'mock_order_' + Date.now(),
-          amount: amount * 100,
-          currency,
-        },
-        message: 'Mock payment order (Razorpay not configured)'
-      });
+    const { amount, currency = 'INR', order_db_id } = req.body;
+    if (!amount || amount <= 0) {
+      return res.status(400).json({ success: false, message: 'Invalid amount' });
     }
-
+    const razorpay = getRazorpay();
     const options = {
       amount: Math.round(amount * 100),
       currency,
-      receipt: 'receipt_' + Date.now(),
+      receipt: `receipt_${order_db_id || Date.now()}`,
+      notes: {
+        order_db_id: order_db_id || '',
+        user_id: req.user.id,
+      },
     };
-    const order = await razorpay.orders.create(options);
-    res.json({ success: true, order });
+    const razorpayOrder = await razorpay.orders.create(options);
+    res.json({
+      success: true,
+      order: razorpayOrder,
+      key_id: process.env.RAZORPAY_KEY_ID,
+    });
   } catch (error) {
-    console.error('Razorpay error:', error);
-    res.status(500).json({ success: false, message: 'Payment initiation failed' });
+    console.error('Razorpay create order error:', error);
+    res.status(500).json({ success: false, message: error.message || 'Payment initiation failed' });
   }
 };
 
 const verifyPayment = async (req, res) => {
   try {
-    const { razorpay_order_id, razorpay_payment_id, razorpay_signature, order_db_id } = req.body;
+    const {
+      razorpay_order_id,
+      razorpay_payment_id,
+      razorpay_signature,
+      order_db_id,
+    } = req.body;
 
-    if (razorpay_order_id?.startsWith('mock_order_')) {
-      if (order_db_id) {
-        await pool.execute(
-          'UPDATE orders SET payment_status = "paid", payment_id = ?, status = "preparing" WHERE id = ? AND user_id = ?',
-          [razorpay_payment_id || 'mock_payment', order_db_id, req.user.id]
-        );
-      }
-      return res.json({ success: true, message: 'Payment verified' });
+    if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature) {
+      return res.status(400).json({ success: false, message: 'Missing payment details' });
     }
 
-    const crypto = require('crypto');
     const body = razorpay_order_id + '|' + razorpay_payment_id;
     const expectedSignature = crypto
       .createHmac('sha256', process.env.RAZORPAY_KEY_SECRET)
@@ -65,25 +60,37 @@ const verifyPayment = async (req, res) => {
       .digest('hex');
 
     if (expectedSignature !== razorpay_signature) {
-      return res.status(400).json({ success: false, message: 'Payment verification failed' });
-    }
-
-    if (order_db_id) {
       await pool.execute(
-        'UPDATE orders SET payment_status = "paid", payment_id = ?, status = "preparing" WHERE id = ? AND user_id = ?',
-        [razorpay_payment_id, order_db_id, req.user.id]
+        'UPDATE orders SET payment_status = "failed" WHERE id = ? AND user_id = ?',
+        [order_db_id, req.user.id]
       );
+      return res.status(400).json({ success: false, message: 'Payment verification failed. Please contact support.' });
     }
 
     await pool.execute(
-      'INSERT INTO notifications (user_id, type, title, message) VALUES (?, ?, ?, ?)',
-      [req.user.id, 'order', 'Payment Successful!', 'Your payment was received. Your gift is now being prepared.']
+      'UPDATE orders SET payment_status = "paid", payment_id = ?, status = "preparing" WHERE id = ? AND user_id = ?',
+      [razorpay_payment_id, order_db_id, req.user.id]
     );
 
-    res.json({ success: true, message: 'Payment verified successfully' });
+    const [[order]] = await pool.execute(
+      'SELECT order_number FROM orders WHERE id = ?',
+      [order_db_id]
+    );
+
+    await pool.execute(
+      'INSERT INTO notifications (user_id, type, title, message, action_label) VALUES (?, ?, ?, ?, ?)',
+      [
+        req.user.id, 'order',
+        `Payment successful! Order #${order?.order_number}`,
+        'Your payment was received. Your gift is now being lovingly prepared.',
+        'Track Order'
+      ]
+    );
+
+    res.json({ success: true, message: 'Payment verified', order_number: order?.order_number });
   } catch (error) {
     console.error('Payment verify error:', error);
-    res.status(500).json({ success: false, message: 'Server error' });
+    res.status(500).json({ success: false, message: 'Server error during verification' });
   }
 };
 
@@ -117,7 +124,6 @@ const validateCoupon = async (req, res) => {
       message: `${coupon.discount_percent}% discount applied! You save ₹${discount}`
     });
   } catch (error) {
-    console.error('Coupon error:', error);
     res.status(500).json({ success: false, message: 'Server error' });
   }
 };

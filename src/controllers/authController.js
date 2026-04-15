@@ -83,13 +83,21 @@ const login = async (req, res) => {
 const forgotPassword = async (req, res) => {
   try {
     const { email } = req.body;
-    const [users] = await pool.execute('SELECT id FROM users WHERE email = ?', [email]);
-    if (!users.length) {
-      return res.status(404).json({ success: false, message: 'Email not found' });
+    if (!email) {
+      return res.status(400).json({ success: false, message: 'Email is required' });
     }
-    // In production: send real email with reset link
-    res.json({ success: true, message: 'Password reset link sent to your email' });
+    const [users] = await pool.execute('SELECT id, name FROM users WHERE email = ?', [email]);
+    if (!users.length) {
+      return res.status(404).json({ success: false, message: 'No account found with this email address' });
+    }
+    // In production: send real reset email here
+    // For now: just confirm the email exists
+    res.json({ 
+      success: true, 
+      message: 'Password reset link sent to your email' 
+    });
   } catch (error) {
+    console.error('Forgot password error:', error);
     res.status(500).json({ success: false, message: 'Server error' });
   }
 };
